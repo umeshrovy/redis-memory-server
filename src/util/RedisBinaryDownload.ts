@@ -4,6 +4,8 @@ import fs from 'fs';
 import rimraf from 'rimraf';
 import https from 'https';
 import tar from 'tar';
+import extract from 'extract-zip';
+
 import RedisBinaryDownloadUrl from './RedisBinaryDownloadUrl';
 import { DownloadProgressT } from '../types';
 import { LATEST_VERSION } from './RedisBinary';
@@ -55,7 +57,7 @@ export default class RedisBinaryDownload {
    * otherwise download it and then return the path
    */
   async getRedisServerPath(): Promise<string> {
-    const binaryName = 'redis-server';
+    const binaryName = process.platform === 'win32' ? 'redis-server.exe' : 'redis-server';
     const redisServerPath = path.resolve(this.downloadDir, this.version, binaryName);
 
     if (await this.locationExists(redisServerPath)) {
@@ -64,7 +66,11 @@ export default class RedisBinaryDownload {
 
     const redisArchive = await this.startDownload();
     const extractDir = await this.extract(redisArchive);
-    await this.makeInstall(extractDir);
+    if (process.platform === 'win32') {
+      await this.makeInstallWin32(extractDir);
+    } else {
+      await this.makeInstall(extractDir);
+    }
     fs.unlinkSync(redisArchive);
 
     if (await this.locationExists(redisServerPath)) {
@@ -161,7 +167,9 @@ export default class RedisBinaryDownload {
       fs.mkdirSync(extractDir, { recursive: true });
     }
 
-    if (redisArchive.endsWith('.tar.gz')) {
+    if (redisArchive.endsWith('.zip')) {
+      await this.extractZip(redisArchive, extractDir);
+    } else if (redisArchive.endsWith('.tar.gz')) {
       await this.extractTarGz(redisArchive, extractDir);
     } else {
       throw new Error(
@@ -188,6 +196,15 @@ export default class RedisBinaryDownload {
   }
 
   /**
+   * Extract a .zip archive
+   * @param redisArchive Archive location
+   * @param extractDir Directory to extract to
+   */
+  async extractZip(redisArchive: string, extractDir: string): Promise<void> {
+    await extract(redisArchive, { dir: extractDir });
+  }
+
+  /**
    * Downlaod given httpOptions to tempDownloadLocation, then move it to downloadLocation
    * @param httpOptions The httpOptions directly passed to https.get
    * @param downloadLocation The location the File should be after the download
@@ -202,62 +219,87 @@ export default class RedisBinaryDownload {
       const fileStream = fs.createWriteStream(tempDownloadLocation);
 
       log(`trying to download https://${httpOptions.hostname}${httpOptions.path}`);
-      https
-        .get(httpOptions as any, (response) => {
-          // "as any" because otherwise the "agent" wouldnt match
-          if (response.statusCode != 200) {
-            if (response.statusCode === 404) {
-              reject(
-                new Error(
-                  'Status Code is 404\n' +
-                    "This means that the requested version doesn't exist\n" +
-                    `  Used Url: "https://${httpOptions.hostname}${httpOptions.path}"\n` +
-                    "Try to use different version 'new RedisMemoryServer({ binary: { version: 'X.Y.Z' } })'\n"
-                )
-              );
+
+      const get = () => {
+        https
+          .get(httpOptions as any, (response) => {
+            // "as any" because otherwise the "agent" wouldnt match
+            if (response.statusCode != 200) {
+              if (response.statusCode === 301 || response.statusCode === 302) {
+                const urlObject = url.parse(response.headers.location as string);
+
+                if (urlObject.hostname) {
+                  httpOptions.hostname = urlObject.hostname;
+                }
+                if (urlObject.port) {
+                  httpOptions.port = urlObject.port;
+                }
+                if (urlObject.path) {
+                  httpOptions.path = urlObject.path;
+                }
+
+                if (!urlObject.hostname || !urlObject.path) {
+                  return reject(
+                    new Error(`Provided incorrect download url: ${response.headers.location}`)
+                  );
+                }
+
+                return get();
+              }
+              if (response.statusCode === 404) {
+                reject(
+                  new Error(
+                    'Status Code is 404\n' +
+                      "This means that the requested version doesn't exist\n" +
+                      `  Used Url: "https://${httpOptions.hostname}${httpOptions.path}"\n` +
+                      "Try to use different version 'new RedisMemoryServer({ binary: { version: 'X.Y.Z' } })'\n"
+                  )
+                );
+                return;
+              }
+              reject(new Error('Status Code isnt 200!'));
               return;
             }
-            reject(new Error('Status Code isnt 200!'));
-            return;
-          }
-          if (typeof response.headers['content-length'] != 'string') {
-            reject(new Error('Response header "content-length" is empty!'));
-            return;
-          }
-          this.dlProgress.current = 0;
-          this.dlProgress.length = parseInt(response.headers['content-length'], 10);
-          this.dlProgress.totalMb = Math.round((this.dlProgress.length / 1048576) * 10) / 10;
-
-          response.pipe(fileStream);
-
-          fileStream.on('finish', async () => {
-            if (this.dlProgress.current < this.dlProgress.length) {
-              const downloadUrl =
-                this._downloadingUrl || `https://${httpOptions.hostname}/${httpOptions.path}`;
-              reject(
-                new Error(
-                  `Too small (${this.dlProgress.current} bytes) redis-server binary downloaded from ${downloadUrl}`
-                )
-              );
+            if (typeof response.headers['content-length'] != 'string') {
+              reject(new Error('Response header "content-length" is empty!'));
               return;
             }
+            this.dlProgress.current = 0;
+            this.dlProgress.length = parseInt(response.headers['content-length'], 10);
+            this.dlProgress.totalMb = Math.round((this.dlProgress.length / 1048576) * 10) / 10;
 
-            fileStream.close();
-            await promisify(fs.rename)(tempDownloadLocation, downloadLocation);
-            log(`moved ${tempDownloadLocation} to ${downloadLocation}`);
+            response.pipe(fileStream);
 
-            resolve(downloadLocation);
+            fileStream.on('finish', async () => {
+              if (this.dlProgress.current < this.dlProgress.length) {
+                const downloadUrl =
+                  this._downloadingUrl || `https://${httpOptions.hostname}/${httpOptions.path}`;
+                reject(
+                  new Error(
+                    `Too small (${this.dlProgress.current} bytes) redis-server binary downloaded from ${downloadUrl}`
+                  )
+                );
+                return;
+              }
+
+              fileStream.close();
+              await promisify(fs.rename)(tempDownloadLocation, downloadLocation);
+              log(`moved ${tempDownloadLocation} to ${downloadLocation}`);
+
+              resolve(downloadLocation);
+            });
+
+            response.on('data', (chunk: any) => {
+              this.printDownloadProgress(chunk);
+            });
+          })
+          .on('error', (e: Error) => {
+            // log it without having debug enabled
+            console.error(`Couldnt download ${httpOptions.path}!`, e.message);
+            reject(e);
           });
-
-          response.on('data', (chunk: any) => {
-            this.printDownloadProgress(chunk);
-          });
-        })
-        .on('error', (e: Error) => {
-          // log it without having debug enabled
-          console.error(`Couldnt download ${httpOptions.path}!`, e.message);
-          reject(e);
-        });
+      };
+      get();
     });
   }
 
@@ -307,6 +349,21 @@ export default class RedisBinaryDownload {
   }
 
   /**
+   * copy binary to parent folder and delete given extracted directory
+   * @param extractDir Extracted directory location
+   * @returns void
+   */
+  async makeInstallWin32(extractDir: string): Promise<void> {
+    const binaryName = 'redis-server.exe';
+    log(`makeInstallWin32(): ${extractDir}`);
+    await promisify(fs.copyFile)(
+      path.resolve(extractDir, '.', binaryName),
+      path.resolve(extractDir, '..', binaryName)
+    );
+    await promisify(rimraf)(extractDir);
+  }
+
+  /**
    * Test if the location given is already used
    * Does *not* dereference links
    * @param location The Path to test
@@ -315,7 +372,7 @@ export default class RedisBinaryDownload {
     try {
       await promisify(fs.lstat)(location);
       return true;
-    } catch (e) {
+    } catch (e: any) {
       if (e.code !== 'ENOENT') {
         throw e;
       }
